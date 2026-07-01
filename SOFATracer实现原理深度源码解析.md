@@ -1025,10 +1025,10 @@ flowchart TB
         D -->|否| E[initLock 双重检查<br/>新建 StatValues]
         D -->|是| F[StatValues.update<br/>CAS 累加]
     end
-    subgraph 定时线程[Tracer-TimedAppender 守护线程 60s]
-        G[scheduleAtFixedRate 触发] --> H{shouldPrintNow?}
+    subgraph 定时线程[SofaTracerStatisticReporterManager<br/>内部 ScheduledExecutorService<br/>线程名 Tracer-TimedAppender-N-60 60s 周期]
+        G[StatReporterPrinter.run<br/>scheduleAtFixedRate 触发] --> H{shouldPrintNow?}
         H -->|是| I[shiftCurrentIndex<br/>双缓冲翻转]
-        I --> J[遍历旧 Map]
+        I --> J[遍历 statReporters.values<br/>逐个 reporter 处理]
         J --> K{count > 0?}
         K -->|是| L[print: XStringBuilder/JsonStringBuilder]
         L --> M[StatValues.clear<br/>扣除已打印]

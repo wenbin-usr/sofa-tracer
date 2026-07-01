@@ -1322,11 +1322,11 @@ sequenceDiagram
     alt digest 未禁用
         ADR->>Disk: digestReport(span)
         Disk->>Async: getSofaTracerDigestReporterAsyncManager()<br/>.append(span)
-        Note over Async: Disruptor RingBuffer<br/>异步落盘 digest 日志
+        Note over Async: 仅入队 Disruptor RingBuffer<br/>落盘由消费者线程异步完成
     end
     ADR->>Disk: statisticReport(span)
     Disk->>Stat: statReporter.reportStat(span)
-    Note over Stat: addStat -> CAS 累加<br/>双缓冲 Map<br/>等 60s 定时打印
+    Note over Stat: 仅 CAS 累加到双缓冲 Map<br/>落盘由 60s 定时任务触发
 ```
 
 **职责分离**：

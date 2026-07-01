@@ -56,7 +56,6 @@ public class AsyncCommonDigestAppenderManager {
 
     private List<Consumer>                   consumers;
     private AtomicInteger                    index                         = new AtomicInteger(0);
-    private static final int                 DEFAULT_CONSUMER_NUMBER       = 3;
 
     private boolean                          allowDiscard;
     private boolean                          isOutDiscardNumber;
@@ -69,6 +68,7 @@ public class AsyncCommonDigestAppenderManager {
     private static final String              DEFAULT_IS_OUT_DISCARD_ID     = "false";
 
     private static final String              DEFAULT_DISCARD_OUT_THRESHOLD = "500";
+    private static final int                 DEFAULT_CONSUMER_NUMBER       = 3;
 
     public AsyncCommonDigestAppenderManager(int queueSize) {
         this(queueSize, DEFAULT_CONSUMER_NUMBER);

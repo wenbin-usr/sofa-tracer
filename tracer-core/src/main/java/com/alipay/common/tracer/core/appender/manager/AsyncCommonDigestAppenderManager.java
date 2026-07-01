@@ -70,6 +70,10 @@ public class AsyncCommonDigestAppenderManager {
 
     private static final String              DEFAULT_DISCARD_OUT_THRESHOLD = "500";
 
+    public AsyncCommonDigestAppenderManager(int queueSize) {
+        this(queueSize, DEFAULT_CONSUMER_NUMBER);
+    }
+
     public AsyncCommonDigestAppenderManager(int queueSize, int consumerNumber) {
         int realQueueSize = 1 << (32 - Integer.numberOfLeadingZeros(queueSize - 1));
         disruptor = new Disruptor<SofaTracerSpanEvent>(new SofaTracerSpanEventFactory(),
@@ -101,10 +105,6 @@ public class AsyncCommonDigestAppenderManager {
                 this.discardCount = new PaddedAtomicLong(0L);
             }
         }
-    }
-
-    public AsyncCommonDigestAppenderManager(int queueSize) {
-        this(queueSize, DEFAULT_CONSUMER_NUMBER);
     }
 
     public void start(final String workerName) {

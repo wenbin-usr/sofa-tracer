@@ -1213,6 +1213,127 @@ sequenceDiagram
 
 ## 八、Reporter 体系与扩展机制
 
+### 8.0 Tracer 与 Reporter 的关系
+
+**持有关系**：`SofaTracer` 持有 4 个 `Reporter` 引用，按 Span 类型分流。
+
+```mermaid
+classDiagram
+    direction LR
+    class Tracer {
+        <<interface opentracing>>
+        +buildSpan(operationName) SpanBuilder
+        +inject(spanContext, format, carrier)
+        +extract(format, carrier) SpanContext
+    }
+    class SofaTracer {
+        -String tracerType
+        -Reporter clientReporter
+        -Reporter serverReporter
+        -Reporter clientEventReporter
+        -Reporter serverEventReporter
+        -Sampler sampler
+        -Map tracerTags
+        +reportSpan(span)
+        +reportEvent(span)
+        +close()
+        #invokeReportListeners(span)
+    }
+    class Reporter {
+        <<interface>>
+        +getReporterType() String
+        +report(span) void
+        +close() void
+        +REMOTE_REPORTER
+        +COMPOSITE_REPORTER
+    }
+    class AbstractReporter {
+        -AtomicBoolean isClosePrint
+        +report(span)
+        +doReport(span)*
+    }
+    class AbstractDiskReporter {
+        +doReport(span)
+        +digestReport(span)*
+        +statisticReport(span)*
+        +isDisableDigestLog(span)
+    }
+    class DiskReporterImpl {
+        -String digestLogType
+        -SpanEncoder contextEncoder
+        -SofaTracerStatisticReporter statReporter
+        +digestReport(span)
+        +statisticReport(span)
+        -initDigestFile()
+    }
+    class SofaTracerCompositeDigestReporterImpl {
+        -Map~String,Reporter~ compositedReporters
+        +addReporter(reporter)
+        +doReport(span)
+    }
+    class SofaTracerSpan {
+        -SofaTracer sofaTracer
+        -SofaTracerSpanContext spanContext
+        +finish()
+        +finish(endTime)
+    }
+
+    Tracer <|.. SofaTracer : implements
+    Reporter <|.. AbstractReporter : implements
+    AbstractReporter <|-- AbstractDiskReporter
+    AbstractDiskReporter <|-- DiskReporterImpl
+    AbstractReporter <|-- SofaTracerCompositeDigestReporterImpl
+    SofaTracer o-- Reporter : 持有 4 个<br/>client/server/event Reporter
+    DiskReporterImpl o-- SofaTracerStatisticReporter : 持有 statReporter
+    SofaTracerCompositeDigestReporterImpl o-- Reporter : 组合多个子 Reporter
+    SofaTracerSpan --> SofaTracer : finish() 调用 reportSpan
+```
+
+**调用链路**：`SofaTracerSpan.finish()` → `SofaTracer.reportSpan()` → 按 Span 类型路由到 `clientReporter`/`serverReporter` → 最终落到 `DiskReporterImpl` 的 digest（Disruptor 异步）+ stat（CAS 聚合 + 定时打印）。
+
+```mermaid
+sequenceDiagram
+    participant Span as SofaTracerSpan
+    participant Tracer as SofaTracer
+    participant Sampler as Sampler
+    participant Listener as SpanReportListener
+    participant Rep as clientReporter/serverReporter
+    participant ADR as AbstractDiskReporter
+    participant Disk as DiskReporterImpl
+    participant Async as AsyncCommonDigestAppenderManager
+    participant Stat as SofaTracerStatisticReporter
+
+    Span->>Tracer: finish() -> reportSpan(span)
+    alt 根客户端 span (isClient && parent==null)
+        Tracer->>Sampler: sample(span)
+        Sampler-->>Tracer: SamplingStatus
+        Tracer->>Tracer: spanContext.setSampled(isSampled)
+    end
+    Tracer->>Listener: invokeReportListeners<br/>onSpanReport(span)
+    alt span.isClient() 或 FLEXIBLE
+        Tracer->>Rep: clientReporter.report(span)
+    else span.isServer()
+        Tracer->>Rep: serverReporter.report(span)
+    end
+    Note over Rep: AbstractReporter.report<br/>isClosePrint 检查
+    Rep->>ADR: doReport(span)
+    ADR->>ADR: span.setLogType(digestLogType)
+    ADR->>ADR: isDisableDigestLog(span)?<br/>(sampled=false / 配置禁用)
+    alt digest 未禁用
+        ADR->>Disk: digestReport(span)
+        Disk->>Async: getSofaTracerDigestReporterAsyncManager()<br/>.append(span)
+        Note over Async: Disruptor RingBuffer<br/>异步落盘 digest 日志
+    end
+    ADR->>Disk: statisticReport(span)
+    Disk->>Stat: statReporter.reportStat(span)
+    Note over Stat: addStat -> CAS 累加<br/>双缓冲 Map<br/>等 60s 定时打印
+```
+
+**职责分离**：
+- **Tracer** 负责 Span 的创建（`buildSpan`）、透传（`inject`/`extract`）、采样决策（`sampler`）、监听器回调（`invokeReportListeners`）、按 Span 类型路由到对应 Reporter
+- **Reporter** 负责 Span 的上报/落盘，Tracer 不关心具体怎么落盘（本地磁盘 / 远程 Zipkin）
+- `SofaTracerCompositeDigestReporterImpl`（组合模式）可同时把 Span 上报给多个目的地（如本地 digest + 远程 Zipkin）
+
 ### 8.1 Reporter 接口
 
 ```java

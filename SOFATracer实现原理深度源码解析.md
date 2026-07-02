@@ -1039,6 +1039,268 @@ flowchart TB
     L --> Q[TimedRollingFileAppender.append<br/>stat 日志落盘]
 ```
 
+### 6.10 如何保证"这一分钟的数据"且不重复采集
+
+stat 日志的核心难题：多个业务线程并发累加，定时任务每 60s 打印一次，如何保证
+
+1. **打印的数据恰好属于这一分钟**（不混入下一分钟的数据）
+2. **不重复采集**（同一条调用不会被打印两次）
+3. **不丢失**（翻转瞬间飞行中的 update 不会丢）
+
+SOFATracer 通过 **双缓冲翻转 + AtomicReference 快照 + CAS 扣除** 三者配合解决。下面逐一拆解。
+
+#### 6.10.1 双缓冲翻转划定时间边界
+
+文件：`AbstractSofaTracerStatisticReporter.java:97`
+
+```java
+// 两套 Map 交替使用
+private Map<StatKey, StatValues>[] statDatasPair = new ConcurrentHashMap[2];
+private int currentIndex = 0;
+// 业务线程写入的"当前 Map"，addStat 只往这里写
+protected Map<StatKey, StatValues> statDatas;
+```
+
+构造时初始化两个 Map，`statDatas` 指向 `statDatasPair[0]`：
+
+```java
+for (int i = 0; i < 2; i++) {
+    this.statDatasPair[i] = new ConcurrentHashMap<StatKey, StatValues>(100);
+}
+this.statDatas = statDatasPair[currentIndex];   // currentIndex=0
+```
+
+定时任务触发翻转 `shiftCurrentIndex`：
+
+```java
+public Map<StatKey, StatValues> shiftCurrentIndex() {
+    Map<StatKey, StatValues> last = statDatasPair[currentIndex];  // 旧 Map（要打印）
+    currentIndex = 1 - currentIndex;                              // 0 <-> 1 翻转
+    statDatas = statDatasPair[currentIndex];                      // 指向新 Map（接下来写入）
+    return last;                                                  // 返回旧 Map 供打印
+}
+```
+
+**翻转瞬间就是时间边界**：
+- 翻转前的累加 → 旧 Map（本周打印）
+- 翻转后的累加 → 新 Map（下周打印）
+
+翻转后 `statDatas` 立即指向新 Map，业务线程 `addStat` 通过 `statDatas.get(keys)` 取的是新 Map 的 StatValues，不会污染正在打印的旧 Map。
+
+#### 6.10.2 业务线程：addStat 只写"当前 Map"
+
+文件：`AbstractSofaTracerStatisticReporter.java:197`
+
+```java
+protected void addStat(StatKey keys, long... values) {
+    // statDatas 是 volatile 吗？不是！但翻转后新写入会落到新 Map
+    StatValues oldValues = statDatas.get(keys);
+    if (oldValues == null) {
+        initLock.lock();                    // 双重检查锁初始化 slot
+        try {
+            oldValues = statDatas.get(keys);
+            if (null == oldValues) {
+                oldValues = new StatValues(values);
+                statDatas.put(keys, oldValues);
+                return;
+            }
+        } finally {
+            initLock.unlock();
+        }
+    }
+    if (oldValues != null) {
+        oldValues.update(values);           // CAS 累加
+    }
+}
+```
+
+**关键点**：业务线程先 `statDatas.get(keys)` 拿到 StatValues 引用，再 `update`。翻转瞬间若已拿到引用但还未 update，这个 update 会作用在**旧 Map 的 StatValues** 上——这是"飞行中 update"问题，由 6.10.4 的 CAS 扣除解决。
+
+#### 6.10.3 StatValues：AtomicReference 不可变快照
+
+文件：`StatValues.java:43`
+
+```java
+public class StatValues {
+    private final AtomicReference<long[]> values = new AtomicReference<long[]>();
+
+    // CAS 累加：替换整个数组引用，从不原地修改
+    public void update(long[] update) {
+        long[] current;
+        long[] tmp = new long[update.length];
+        do {
+            current = values.get();                          // 读当前数组
+            for (int k = 0; k < update.length && k < current.length; k++) {
+                tmp[k] = current[k] + update[k];            // 累加到新数组
+            }
+        } while (!values.compareAndSet(current, tmp));      // CAS 替换引用
+    }
+
+    // 返回快照（数组引用永不变，因为修改即替换整个数组）
+    public long[] getCurrentValue() {
+        return values.get();
+    }
+
+    // CAS 扣除已打印值
+    public void clear(long[] toBeClear) {
+        long[] current;
+        long[] tmp = new long[toBeClear.length];
+        do {
+            current = values.get();                          // 读当前最新值
+            for (int k = 0; k < current.length && k < toBeClear.length; k++) {
+                tmp[k] = current[k] - toBeClear[k];         // 扣除已打印
+            }
+        } while (!values.compareAndSet(current, tmp));      // CAS 替换引用
+    }
+}
+```
+
+**核心设计**：所有修改都通过 CAS **替换整个数组引用**，从不原地修改数组元素。因此 `getCurrentValue()` 返回的数组快照永远是一个不可变的稳定值，即使打印期间有并发 update，快照也不会被改（update 会 CAS 替换为新数组）。
+
+#### 6.10.4 定时任务：取快照 → 打印 → CAS 扣除
+
+文件：`SofaTracerStatisticReporterManager.java:135`（内部类 `StatReporterPrinter`）
+
+```java
+class StatReporterPrinter implements Runnable {
+    @Override
+    public void run() {
+        for (SofaTracerStatisticReporter statTracer : statReporters.values()) {
+            if (statTracer.shouldPrintNow()) {
+                // 1. 翻转双缓冲：返回旧 Map，currentIndex 翻转，statDatas 指向新 Map
+                Map<StatKey, StatValues> statDatas = statTracer.shiftCurrentIndex();
+
+                for (Map.Entry<StatKey, StatValues> e : statDatas.entrySet()) {
+                    StatKey statKeys = e.getKey();
+                    StatValues values = e.getValue();
+
+                    // 2. 取快照（不可变数组引用）
+                    long[] tobePrint = values.getCurrentValue();
+
+                    // 3. count > 0 才打印
+                    if (tobePrint[0] > 0) {
+                        statTracer.print(statKeys, tobePrint);   // 落盘快照值
+                    }
+
+                    // 4. CAS 扣除已打印值（关键！）
+                    values.clear(tobePrint);
+                }
+
+                // 5. key 数量超阈值则清空，防止变量参数导致内存膨胀
+                if (statDatas.size() > CLEAR_STAT_KEY_THRESHOLD) {
+                    statDatas.clear();
+                }
+            }
+        }
+    }
+}
+```
+
+#### 6.10.5 两种时序分析：不重复不丢失
+
+假设翻转前某 StatValues 为 `[count=10, cost=1000]`，业务线程 A 已拿到该 SV 引用，正准备 `update([1,100])`。
+
+**情况一：A 的 update 在 `getCurrentValue` 之前完成**
+
+```
+A.update         -> StatValues CAS: [10,1000] -> [11,1100]
+定时任务取快照    -> getCurrentValue() = [11,1100]
+定时任务 print   -> 落盘 [11,1100]
+定时任务 clear   -> CAS: current=[11,1100], tmp=[11,1100]-[11,1100]=[0,0]
+```
+
+结果：`[11,1100]` 完整打印，下周期为 0。**不重复不丢失**。
+
+**情况二：A 的 update 在 `getCurrentValue` 之后、`clear` 之前（飞行中 update）**
+
+```
+定时任务取快照    -> getCurrentValue() = [10,1000]
+定时任务 print   -> 落盘 [10,1000]   ← 属于这一分钟
+A.update         -> CAS: [10,1000] -> [11,1100]   ← 飞行中的 update
+定时任务 clear   -> CAS: current=[11,1100], tmp=[11,1100]-[10,1000]=[1,100]
+                                                              ↑ 剩余留在 StatValues
+```
+
+结果：本周期打印 `[10,1000]`（属于这一分钟），剩余 `[1,100]` 留在 StatValues。下一周期翻转回来时这个 Map 作为 `last` 再打印 `[1,100]`。**不重复不丢失**。
+
+**情况三：A 的 update 在 `clear` 之后（已归属下一分钟）**
+
+```
+定时任务取快照    -> [10,1000]
+定时任务 print   -> [10,1000]
+定时任务 clear   -> CAS: [10,1000]-[10,1000]=[0,0]
+A.update         -> CAS: [0,0] -> [1,100]   ← 这个 update 归属下一分钟
+```
+
+结果：本周期打印 `[10,1000]`，A 的 `[1,100]` 留在 StatValues，下周打印。**不重复不丢失**。
+
+> 注意：情况二、三中 A 拿的是**旧 Map 的 SV 引用**，update 作用在旧 Map 的 SV 上。由于 `clear` 也是作用在同一个 SV 上，所以 CAS 扣除能正确处理。下一周期翻转回来时，旧 Map 变成新的 `last`，A 留下的剩余值会被打印。
+
+#### 6.10.6 翻转瞬间并发安全
+
+**问题**：`statDatas` 字段没有 `volatile` 修饰，翻转后业务线程能否立即看到新 Map？
+
+```java
+protected Map<StatKey, StatValues> statDatas;   // 无 volatile
+```
+
+**分析**：
+- `statDatas` 是普通引用，确实存在短暂的可见性延迟
+- 但 `ConcurrentHashMap` 的 `get/put` 本身有内存屏障，业务线程 `statDatas.get(keys)` 时若读到旧 Map，最多把 update 写到旧 Map 的 SV
+- `clear` 的 CAS 扣除会处理这个飞行中 update（见 6.10.5 情况二）
+- 所以这个可见性延迟不会导致数据丢失或重复，只是短暂数据归属在两个 Map 间，最终都会被打印
+
+这是 SOFATracer 的一个工程权衡：为性能牺牲严格可见性，靠 CAS 扣除兜底正确性。
+
+#### 6.10.7 完整时序图
+
+```mermaid
+sequenceDiagram
+    participant Biz1 as 业务线程A
+    participant Biz2 as 业务线程B
+    participant Timer as StatReporterPrinter<br/>(定时任务 60s)
+    participant MapA as Map_A (旧/打印中)
+    participant MapB as Map_B (新/写入中)
+    participant SV as StatValues<br/>(AtomicReference<long[]>)
+    participant Disk as 磁盘
+
+    Note over Biz1,SV: === 翻转前: statDatas 指向 Map_A ===
+    Biz1->>MapA: addStat: statDatas.get(K) 拿到 SV 引用
+    Note over Biz1: 此时还未 update, 准备中...
+    Timer->>Timer: shiftCurrentIndex<br/>last=Map_A, currentIndex 翻转<br/>statDatas=Map_B
+    Note over Biz2,MapB: === 翻转后: 业务线程写 Map_B ===
+    Biz2->>MapB: addStat: statDatas.get(K')<br/>新建/累加 SV'
+    Biz1->>SV: update([1,100]) 飞行中 update<br/>(作用在 Map_A 的 SV 上)
+
+    Timer->>SV: getCurrentValue() 取快照
+    alt update 已完成（情况一）
+        Note over SV: 快照=[11,1100]
+        Timer->>Disk: print([11,1100])
+        Timer->>SV: clear([11,100]) CAS<br/>tmp=[0,0]
+    else update 未完成（情况二）
+        Note over SV: 快照=[10,1000]
+        Timer->>Disk: print([10,1000])
+        Biz1->>SV: update([1,100]) -> [11,1100]
+        Timer->>SV: clear([10,1000]) CAS<br/>current=[11,1100], tmp=[1,100]
+        Note over SV: 剩余 [1,100] 留在 Map_A<br/>下周期翻转回来时再打印
+    end
+```
+
+#### 6.10.8 三大保证总结
+
+| 保证 | 实现机制 |
+|------|----------|
+| **打印的数据属于这一分钟** | 双缓冲翻转：翻转瞬间是时间边界，翻转前累加归旧 Map（本周打印），翻转后累加进新 Map（下周打印） |
+| **不重复采集** | 打印后立即 CAS 扣除已打印值：`clear(tobePrint)` 把 `当前值 - 已打印值 = 剩余`，即使飞行中 update 在打印后到达，扣除后只剩"新增部分"，不会重复打印 |
+| **不丢失** | 扣除后的剩余值（飞行中 update）留在 StatValues 的 AtomicReference 里，下一周期翻转回来时该 Map 作为 `last` 被打印，剩余值不会丢 |
+
+**核心三件套**：
+1. **双缓冲翻转**（`shiftCurrentIndex`）—— 划定时间边界
+2. **AtomicReference 快照**（`getCurrentValue`）—— 打印期间不可变
+3. **CAS 扣除**（`clear`）—— 处理翻转瞬间的飞行中 update
+
+这三者配合，使得 stat 日志在无锁（CAS）的高并发场景下，既能保证数据归属正确的周期，又不重复不丢失。
+
 ---
 
 ## 七、Disruptor 高性能队列使用
